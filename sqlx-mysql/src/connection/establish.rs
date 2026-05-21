@@ -26,6 +26,7 @@ impl MySqlConnection {
             inner: Box::new(MySqlConnectionInner {
                 stream,
                 transaction_depth: 0,
+                transaction_span: None,
                 status_flags: Default::default(),
                 cache_statement: StatementCache::new(options.statement_cache_capacity),
                 log_settings: options.log_settings.clone(),
