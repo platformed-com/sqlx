@@ -209,7 +209,21 @@ impl PgConnection {
             QueryLogger::new_under_span(query, self.inner.log_settings.clone(), parent_span)
                 .with_db_system_name("postgresql");
         let span = logger.span();
-        let sql = logger.sql().as_str();
+        // When the `sqlcommenter` feature is enabled and an OTel trace context is
+        // active, appends `/*traceparent=...*/` to the SQL on the wire so server-side
+        // observability tools can correlate. With no context (or feature off), the
+        // returned Cow is Borrowed and this is a zero-cost no-op.
+        let sql_cow = sqlx_core::sqlcommenter::maybe_append_comment(logger.sql().as_str(), &span);
+        let sql = sql_cow.as_ref();
+        // Override `persistent` to `false` when we actually appended a comment: each
+        // call has a unique trace id baked into the SQL, so caching a "prepared" copy
+        // would (a) miss every time anyway, (b) silently fill the cache with one-shot
+        // named statements that Postgres holds server-side until DEALLOCATE, and
+        // (c) be wrong even on the off-chance of a hit, since the cached statement's
+        // baked-in trace id would no longer match the current span. Sending Parse to
+        // the unnamed statement (`StatementId::UNNAMED`) avoids all three — same wire
+        // round-trips, no cache pollution.
+        let persistent = persistent && matches!(sql_cow, std::borrow::Cow::Borrowed(_));
 
         // before we continue, wait until we are "ready" to accept more queries
         self.wait_until_ready().await?;
