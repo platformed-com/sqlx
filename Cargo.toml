@@ -67,6 +67,14 @@ derive = ["sqlx-macros/derive"]
 macros = ["derive", "sqlx-macros/macros", "sqlx-core/offline", "sqlx-mysql?/offline", "sqlx-postgres?/offline", "sqlx-sqlite?/offline"]
 migrate = ["sqlx-core/migrate", "sqlx-macros?/migrate", "sqlx-mysql?/migrate", "sqlx-postgres?/migrate", "sqlx-sqlite?/migrate"]
 
+# Append sqlcommenter trailing comments to outgoing queries on backends that
+# support it (PostgreSQL, MySQL — SQLite has no managed observability
+# consumer). Pulls trace context from OTel's globally configured propagator
+# (typically W3C TraceContext via `tracing-opentelemetry`). When a comment
+# is appended, the backend executor routes through the non-cached prepare
+# path so the statement cache isn't polluted with one-shot entries.
+sqlcommenter = ["sqlx-core/sqlcommenter", "sqlx-mysql?/sqlcommenter", "sqlx-postgres?/sqlcommenter"]
+
 # Enable parsing of `sqlx.toml` for configuring macros and migrations.
 sqlx-toml = ["sqlx-core/sqlx-toml", "sqlx-macros?/sqlx-toml", "sqlx-sqlite?/sqlx-toml"]
 
