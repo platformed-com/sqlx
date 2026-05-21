@@ -7,9 +7,10 @@ use crate::message::{
     ParseComplete, RowDescription,
 };
 use crate::statement::PgStatementMetadata;
+use crate::transaction::TransactionManager;
 use crate::{
-    statement::PgStatement, PgArguments, PgConnection, PgQueryResult, PgRow, PgTypeInfo,
-    PgValueFormat, Postgres,
+    statement::PgStatement, PgArguments, PgConnection, PgQueryResult, PgRow, PgTransactionManager,
+    PgTypeInfo, PgValueFormat, Postgres,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -203,8 +204,10 @@ impl PgConnection {
         persistent: bool,
         metadata_opt: Option<Arc<PgStatementMetadata>>,
     ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error> {
-        let mut logger = QueryLogger::new(query, self.inner.log_settings.clone())
-            .with_db_system_name("postgresql");
+        let parent_span = PgTransactionManager::query_parent_span(self);
+        let mut logger =
+            QueryLogger::new_under_span(query, self.inner.log_settings.clone(), parent_span)
+                .with_db_system_name("postgresql");
         let span = logger.span();
         let sql = logger.sql().as_str();
 

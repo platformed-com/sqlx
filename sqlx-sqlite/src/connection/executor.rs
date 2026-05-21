@@ -1,5 +1,6 @@
 use crate::{
-    Sqlite, SqliteConnection, SqliteQueryResult, SqliteRow, SqliteStatement, SqliteTypeInfo,
+    Sqlite, SqliteConnection, SqliteQueryResult, SqliteRow, SqliteStatement,
+    SqliteTransactionManager, SqliteTypeInfo,
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
@@ -7,6 +8,7 @@ use futures_util::{stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use sqlx_core::error::Error;
 use sqlx_core::executor::{Execute, Executor};
 use sqlx_core::sql_str::SqlStr;
+use sqlx_core::transaction::TransactionManager;
 use sqlx_core::Either;
 use std::{future, pin::pin};
 
@@ -29,10 +31,18 @@ impl<'c> Executor<'c> for &'c mut SqliteConnection {
         };
         let persistent = query.persistent() && arguments.is_some();
         let sql = query.sql();
+        let parent_span = SqliteTransactionManager::query_parent_span(self);
 
         Box::pin(
             self.worker
-                .execute(sql, arguments, self.row_channel_size, persistent, None)
+                .execute(
+                    sql,
+                    arguments,
+                    self.row_channel_size,
+                    persistent,
+                    None,
+                    parent_span,
+                )
                 .map_ok(flume::Receiver::into_stream)
                 .try_flatten_stream(),
         )
@@ -54,11 +64,19 @@ impl<'c> Executor<'c> for &'c mut SqliteConnection {
         };
         let persistent = query.persistent() && arguments.is_some();
 
+        let parent_span = SqliteTransactionManager::query_parent_span(self);
         Box::pin(async move {
             let sql = query.sql();
             let mut stream = pin!(self
                 .worker
-                .execute(sql, arguments, self.row_channel_size, persistent, Some(1))
+                .execute(
+                    sql,
+                    arguments,
+                    self.row_channel_size,
+                    persistent,
+                    Some(1),
+                    parent_span,
+                )
                 .map_ok(flume::Receiver::into_stream)
                 .try_flatten_stream());
 
