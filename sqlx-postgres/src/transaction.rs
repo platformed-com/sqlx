@@ -73,6 +73,34 @@ impl TransactionManager for PgTransactionManager {
     fn get_transaction_depth(conn: &<Self::Database as Database>::Connection) -> usize {
         conn.inner.transaction_depth
     }
+
+    fn set_transaction_span(
+        conn: &mut PgConnection,
+        span: tracing::Span,
+        parent_at_begin: Option<tracing::Id>,
+    ) {
+        conn.inner.transaction_span = Some((span, parent_at_begin));
+    }
+
+    fn clear_transaction_span(conn: &mut PgConnection) {
+        conn.inner.transaction_span = None;
+    }
+
+    fn current_transaction_span(conn: &PgConnection) -> Option<tracing::Span> {
+        conn.inner
+            .transaction_span
+            .as_ref()
+            .map(|(span, _)| span.clone())
+    }
+
+    fn query_parent_span(conn: &PgConnection) -> Option<tracing::Span> {
+        let (tx_span, parent_at_begin) = conn.inner.transaction_span.as_ref()?;
+        if tracing::Span::current().id() == *parent_at_begin {
+            Some(tx_span.clone())
+        } else {
+            None
+        }
+    }
 }
 
 struct Rollback<'c> {

@@ -368,8 +368,14 @@ impl ConnectionWorker {
         chan_size: usize,
         persistent: bool,
         limit: Option<usize>,
+        parent_span: Option<tracing::Span>,
     ) -> Result<flume::Receiver<Result<Either<SqliteQueryResult, SqliteRow>, Error>>, Error> {
         let (tx, rx) = flume::bounded(chan_size);
+
+        // The worker thread enters this span before running the query, so the
+        // `QueryLogger` span it creates picks `parent_span` (or the contextual
+        // current span if none was supplied) as its parent.
+        let span = parent_span.unwrap_or_else(Span::current);
 
         self.command_tx
             .send_async((
@@ -380,7 +386,7 @@ impl ConnectionWorker {
                     tx,
                     limit,
                 },
-                Span::current(),
+                span,
             ))
             .await
             .map_err(|_| Error::WorkerCrashed)?;

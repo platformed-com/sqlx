@@ -47,6 +47,59 @@ pub trait TransactionManager {
     /// - Level 1: A transaction is active.
     /// - Level 2 or higher: A transaction is active and one or more SAVEPOINTs have been created within it.
     fn get_transaction_depth(conn: &<Self::Database as Database>::Connection) -> usize;
+
+    /// Records the outermost transaction's tracing span on the connection,
+    /// together with the caller's `Span::current()` at begin time. Called by
+    /// [`Transaction`] only when opening the outermost transaction (not for
+    /// nested savepoints, which share the outer span).
+    ///
+    /// The `parent_at_begin` id drives the user-injected-span heuristic: if
+    /// `Span::current()` at query time still matches it, the caller hasn't
+    /// entered their own span between begin and the query, so we auto-parent
+    /// under the tx span. If they differ, we respect the caller's current.
+    ///
+    /// Default impl is a no-op. In-tree backends override.
+    fn set_transaction_span(
+        _conn: &mut <Self::Database as Database>::Connection,
+        _span: tracing::Span,
+        _parent_at_begin: Option<tracing::Id>,
+    ) {
+    }
+
+    /// Clears the connection's transaction span. Called by [`Transaction`]
+    /// only when the outermost transaction commits, rolls back, or is dropped.
+    ///
+    /// Default impl is a no-op; in-tree backends clear their `Option`.
+    fn clear_transaction_span(_conn: &mut <Self::Database as Database>::Connection) {}
+
+    /// Returns the connection's currently open transaction span, if any.
+    /// Used by [`Transaction::begin`] so savepoint transactions can share the
+    /// outermost transaction's span.
+    ///
+    /// Default impl returns `None`; in-tree backends look at their `Option`.
+    fn current_transaction_span(
+        _conn: &<Self::Database as Database>::Connection,
+    ) -> Option<tracing::Span> {
+        None
+    }
+
+    /// Returns the span the executor should use as the parent for the next
+    /// query span on this connection, or `None` to fall back to
+    /// `Span::current()`.
+    ///
+    /// In-tree backends compare `Span::current()` to the stored
+    /// `parent_at_begin`: if equal, the caller hasn't entered any span since
+    /// `begin`, so the query parents under the tx span; if different, the
+    /// caller has wrapped this query in their own span, so we respect that
+    /// and return `None`.
+    ///
+    /// Default impl returns `None`, preserving pre-tracing behavior for
+    /// out-of-tree drivers.
+    fn query_parent_span(
+        _conn: &<Self::Database as Database>::Connection,
+    ) -> Option<tracing::Span> {
+        None
+    }
 }
 
 /// An in-progress database transaction or savepoint.
@@ -89,6 +142,12 @@ where
 {
     connection: MaybePoolConnection<'c, DB>,
     open: bool,
+    span: tracing::Span,
+    /// True for the outermost transaction, false for nested savepoints. The
+    /// outermost owns the span: it sets it on `begin`, records the outcome,
+    /// and clears it on commit/rollback/drop. Savepoints share the same span
+    /// and don't touch the connection's tracing state.
+    is_outermost: bool,
 }
 
 impl<'c, DB> Transaction<'c, DB>
@@ -103,12 +162,65 @@ where
         let conn = conn.into();
 
         Box::pin(async move {
+            // Hardcoded INFO level per maintainer review of #3313. Field names follow the
+            // OTel database span semantic conventions. `db.transaction.outcome` starts as
+            // `Empty` and gets recorded on commit/rollback/drop so the span carries its
+            // resolution.
+            //
+            // The outermost transaction owns the span; nested savepoints share it, so a
+            // sequence of BEGIN / SAVEPOINT / queries / RELEASE / COMMIT shows up as a
+            // single `db.transaction` span with the per-statement query spans as
+            // children. Per-savepoint duration isn't surfaced — the SAVEPOINT / RELEASE
+            // query spans themselves serve as the markers.
+            let depth_before = DB::TransactionManager::get_transaction_depth(&conn);
+            let is_outermost = depth_before == 0;
+            let span = if is_outermost {
+                tracing::info_span!(
+                    target: "sqlx::transaction",
+                    parent: &tracing::Span::current(),
+                    "db.transaction",
+                    "db.system.name" = %DB::NAME.to_ascii_lowercase(),
+                    "db.operation.name" = "BEGIN",
+                    "db.transaction.outcome" = tracing::field::Empty,
+                    "otel.kind" = "client",
+                )
+            } else {
+                // Reuse the outermost transaction's span so nested savepoint queries
+                // still parent under it.
+                DB::TransactionManager::current_transaction_span(&conn).unwrap_or_else(
+                    // Defensive: out-of-tree drivers that don't override the trait
+                    // methods can land here. Fall back to a fresh detached span — no
+                    // worse than the pre-tracing-spans behavior.
+                    tracing::Span::current,
+                )
+            };
+
             let mut tx = Self {
                 connection: conn,
 
                 // If the call to `begin` fails or doesn't complete we want to attempt a rollback in case the transaction was started.
                 open: true,
+                span: span.clone(),
+                is_outermost,
             };
+
+            // Only the outermost transaction installs the span on the connection;
+            // savepoints inherit it. Set before BEGIN so the BEGIN's query span
+            // parents under it via the executor's `query_parent_span` lookup. If
+            // BEGIN fails, the Drop handler clears it back out (`open: true`).
+            //
+            // `parent_at_begin` lets later `query_parent_span` calls distinguish
+            // "caller is still at the same level as begin" (auto-parent) from
+            // "caller has entered their own span in between" (respect their
+            // current).
+            if is_outermost {
+                let parent_at_begin = tracing::Span::current().id();
+                DB::TransactionManager::set_transaction_span(
+                    &mut tx.connection,
+                    span,
+                    parent_at_begin,
+                );
+            }
 
             DB::TransactionManager::begin(&mut tx.connection, statement).await?;
 
@@ -116,10 +228,27 @@ where
         })
     }
 
+    /// Returns a handle to the transaction's tracing span.
+    ///
+    /// Useful when callers want to manually parent their own spans under the
+    /// transaction — e.g. wrapping a block of procedural work in
+    /// `something.instrument(tx.span())` so user spans inside become children
+    /// of the transaction. The returned `Span` is cheap to clone and `Send`.
+    pub fn span(&self) -> tracing::Span {
+        self.span.clone()
+    }
+
     /// Commits this transaction or savepoint.
     pub async fn commit(mut self) -> Result<(), Error> {
+        // The span stays on the connection across the COMMIT call so the executor
+        // parents the COMMIT's query span under it; cleared only after success, and
+        // only for the outermost transaction (savepoints don't own the span).
         DB::TransactionManager::commit(&mut self.connection).await?;
         self.open = false;
+        if self.is_outermost {
+            self.span.record("db.transaction.outcome", "committed");
+            DB::TransactionManager::clear_transaction_span(&mut self.connection);
+        }
 
         Ok(())
     }
@@ -128,6 +257,10 @@ where
     pub async fn rollback(mut self) -> Result<(), Error> {
         DB::TransactionManager::rollback(&mut self.connection).await?;
         self.open = false;
+        if self.is_outermost {
+            self.span.record("db.transaction.outcome", "rolled_back");
+            DB::TransactionManager::clear_transaction_span(&mut self.connection);
+        }
 
         Ok(())
     }
@@ -275,6 +408,14 @@ where
             // connection (including if the connection is returned to a pool)
 
             DB::TransactionManager::start_rollback(&mut self.connection);
+
+            // Only the outermost transaction owns the span and the connection's tracing
+            // state. Clear after start_rollback so the span is still installed for the
+            // duration of the operation, mirroring commit/rollback.
+            if self.is_outermost {
+                self.span.record("db.transaction.outcome", "dropped");
+                DB::TransactionManager::clear_transaction_span(&mut self.connection);
+            }
         }
     }
 }

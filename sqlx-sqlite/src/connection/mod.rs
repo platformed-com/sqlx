@@ -60,6 +60,10 @@ pub struct SqliteConnection {
     optimize_on_close: OptimizeOnClose,
     pub(crate) worker: ConnectionWorker,
     pub(crate) row_channel_size: usize,
+    /// The outermost open transaction's span and the caller's `Span::current()`
+    /// id at begin time. Set when a top-level transaction begins, cleared when
+    /// it commits/rolls back; nested savepoints share this span.
+    pub(crate) transaction_span: Option<(tracing::Span, Option<tracing::Id>)>,
 }
 
 pub struct LockedSqliteHandle<'a> {
@@ -189,6 +193,7 @@ impl SqliteConnection {
             optimize_on_close: options.optimize_on_close.clone(),
             worker,
             row_channel_size: options.row_channel_size,
+            transaction_span: None,
         })
     }
 

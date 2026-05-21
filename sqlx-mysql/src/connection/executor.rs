@@ -11,10 +11,11 @@ use crate::protocol::statement::{
 };
 use crate::protocol::text::{ColumnDefinition, Query, TextRow};
 use crate::statement::{MySqlStatement, MySqlStatementMetadata};
+use crate::transaction::TransactionManager;
 use crate::HashMap;
 use crate::{
-    MySql, MySqlArguments, MySqlColumn, MySqlConnection, MySqlQueryResult, MySqlRow, MySqlTypeInfo,
-    MySqlValueFormat,
+    MySql, MySqlArguments, MySqlColumn, MySqlConnection, MySqlQueryResult, MySqlRow,
+    MySqlTransactionManager, MySqlTypeInfo, MySqlValueFormat,
 };
 use either::Either;
 use futures_core::future::BoxFuture;
@@ -107,8 +108,10 @@ impl MySqlConnection {
         persistent: bool,
     ) -> Result<impl Stream<Item = Result<Either<MySqlQueryResult, MySqlRow>, Error>> + 'e, Error>
     {
+        let parent_span = MySqlTransactionManager::query_parent_span(self);
         let mut logger =
-            QueryLogger::new(sql, self.inner.log_settings.clone()).with_db_system_name("mysql");
+            QueryLogger::new_under_span(sql, self.inner.log_settings.clone(), parent_span)
+                .with_db_system_name("mysql");
         let span = logger.span();
 
         self.inner.stream.wait_until_ready().await?;
