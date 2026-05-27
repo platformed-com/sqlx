@@ -17,12 +17,15 @@
 //! key/value pair is URL-encoded per RFC 3986 unreserved set, matching the
 //! reference Python implementation.
 //!
-//! The trace context is read from `opentelemetry::Context::current()` while
-//! the supplied tracing span is entered. That works because
-//! `tracing-opentelemetry`'s `Layer` keeps the OTel current context in sync
-//! with the tracing span stack on enter/exit. If no OTel layer is installed,
-//! no propagator is registered, or the current span has no valid trace
-//! context, this returns `None` and the query goes out unmodified.
+//! The trace context is read from the supplied tracing span via
+//! `tracing_opentelemetry::OpenTelemetrySpanExt::context()`, which extracts
+//! the OTel context the `tracing-opentelemetry` layer stashed on the span
+//! when it was created. `opentelemetry::Context::current()` would *not* work
+//! here: the layer doesn't attach the OTel context on span enter, so the
+//! thread-local current context is unrelated to the active tracing span.
+//! If no OTel layer is installed, no propagator is registered, or the span
+//! has no valid trace context, this returns `None` and the query goes out
+//! unmodified.
 
 use std::borrow::Cow;
 
@@ -74,17 +77,18 @@ pub fn comment_for_span(span: &tracing::Span) -> Option<String> {
         }
     }
 
-    // Enter the QueryLogger span briefly so `Context::current()` resolves to
-    // its OTel context (tracing-opentelemetry's `Layer` syncs current-OTel
-    // with current-tracing on enter/exit). The guard is dropped synchronously
-    // before this function returns — never held across an await.
-    let mut carrier = span.in_scope(|| {
-        let cx = opentelemetry::Context::current();
-        let mut carrier = SqlcommenterCarrier::default();
-        opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.inject_context(&cx, &mut carrier);
-        });
-        carrier
+    // Pull the OTel context off the supplied tracing span directly via
+    // `tracing-opentelemetry`'s `SpanExt`. This downcasts the subscriber to
+    // find the OTel layer and reads the `OtelData` extension the layer
+    // stashed on the span at `on_new_span` — no current-context attach
+    // required. Returns a default (empty) context if no OTel layer is
+    // installed or the span has no OTel data, which we handle below via the
+    // empty-carrier check.
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let cx = span.context();
+    let mut carrier = SqlcommenterCarrier::default();
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&cx, &mut carrier);
     });
 
     if carrier.out.is_empty() {
