@@ -16,6 +16,7 @@ any = ["sqlx-core/any"]
 offline = ["sqlx-core/offline", "serde/derive", "bitflags/serde"]
 migrate = ["sqlx-core/migrate"]
 rsa = ["dep:rand", "dep:rsa"]
+sqlcommenter = ["sqlx-core/sqlcommenter"]
 
 # Type Integration features
 bigdecimal = ["dep:bigdecimal", "sqlx-core/bigdecimal"]

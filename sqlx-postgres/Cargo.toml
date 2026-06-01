@@ -14,6 +14,7 @@ any = ["sqlx-core/any"]
 json = ["dep:serde", "dep:serde_json", "sqlx-core/json"]
 migrate = ["sqlx-core/migrate"]
 offline = ["json", "sqlx-core/offline", "smallvec/serde"]
+sqlcommenter = ["sqlx-core/sqlcommenter"]
 
 # Type Integration features
 bigdecimal = ["dep:bigdecimal", "dep:num-bigint", "sqlx-core/bigdecimal"]
