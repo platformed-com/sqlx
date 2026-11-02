@@ -26,12 +26,10 @@ async fn prepare(
     sql: &str,
     arg_types: &[PgTypeInfo],
     metadata: Option<Arc<PgStatementMetadata>>,
-    persistent: bool,
+    named: bool,
     resolve_column_origin: bool,
 ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
-    // if cache is disabled, persistent statements get an id but are never evicted
-    // which causes a memory leak
-    let id = if persistent && conn.inner.cache_statement.is_enabled() {
+    let id = if named {
         let id = conn.inner.next_statement_id;
         conn.inner.next_statement_id = id.next();
         id
@@ -95,8 +93,8 @@ async fn prepare(
 
     // Resolving custom-type OIDs above goes through the simple query protocol, which
     // destroys the unnamed prepared statement. Re-parse it so the Bind that follows can
-    // reference it; named (persistent) statements are unaffected. See #4305.
-    if !persistent && ran_catalog_query {
+    // reference it; named statements are unaffected. See #4305.
+    if id == StatementId::UNNAMED && ran_catalog_query {
         conn.inner.stream.write_msg(Parse {
             param_types: &param_types,
             query: sql,
@@ -179,27 +177,45 @@ impl PgConnection {
         &mut self,
         sql: &str,
         parameters: &[PgTypeInfo],
-        persistent: bool,
+        // Use a server-side *named* prepared statement (vs the unnamed one).
+        // Named statements survive intervening simple-query messages, which is
+        // required if anything between Parse and Bind (e.g. type resolution
+        // queries from `resolve_statement_metadata` / `apply_patches`) might
+        // issue a simple Query — the unnamed statement would otherwise be
+        // destroyed by such a side trip.
+        named: bool,
+        // Insert this prepared statement into the per-connection LRU cache for
+        // later reuse. Implies `named`. When `false` and `named`, the caller is
+        // responsible for `Close::Statement`ing the returned id after use to
+        // avoid accumulating one-shot statements on the server.
+        cache: bool,
         // optional metadata that was provided by the user, this means they are reusing
         // a statement object
         metadata: Option<Arc<PgStatementMetadata>>,
         resolve_column_origin: bool,
     ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
-        if let Some(statement) = self.inner.cache_statement.get_mut(sql) {
-            return Ok((*statement).clone());
+        if cache {
+            if let Some(statement) = self.inner.cache_statement.get_mut(sql) {
+                return Ok((*statement).clone());
+            }
         }
+
+        // A statement meant for the cache is only ever closed by cache eviction, so
+        // if the cache is disabled it would leak server-side: use the unnamed
+        // statement instead. Uncached named statements are closed by the caller.
+        let named = named && (!cache || self.inner.cache_statement.is_enabled());
 
         let statement = prepare(
             self,
             sql,
             parameters,
             metadata,
-            persistent,
+            named,
             resolve_column_origin,
         )
         .await?;
 
-        if persistent && self.inner.cache_statement.is_enabled() {
+        if cache && self.inner.cache_statement.is_enabled() {
             if let Some((id, _)) = self.inner.cache_statement.insert(sql, statement.clone()) {
                 self.inner.stream.write_msg(Close::Statement(id))?;
                 self.write_sync();
@@ -218,7 +234,8 @@ impl PgConnection {
         &'c mut self,
         sql: &str,
         arguments: Option<&mut PgArguments>,
-        persistent: bool,
+        named: bool,
+        cache: bool,
         metadata_opt: Option<Arc<PgStatementMetadata>>,
     ) -> Result<(PgValueFormat, Arc<PgStatementMetadata>), Error> {
         let metadata: Arc<PgStatementMetadata>;
@@ -240,7 +257,7 @@ impl PgConnection {
             // prepare the statement if this our first time executing it
             // always return the statement ID here
             let (statement, metadata_) = self
-                .get_or_prepare(sql, &arguments.types, persistent, metadata_opt, false)
+                .get_or_prepare(sql, &arguments.types, named, cache, metadata_opt, false)
                 .await?;
 
             metadata = metadata_;
@@ -282,6 +299,14 @@ impl PgConnection {
                 .stream
                 .write_msg(Close::Portal(PortalId::UNNAMED))?;
 
+            // If we prepared a named statement that won't be reused via the
+            // LRU cache (e.g. a sqlcommenter-traced query whose SQL is unique
+            // per trace), close it server-side so Postgres doesn't hold it.
+            // The matching CloseComplete is absorbed by the stream loop in `run()`.
+            if named && !cache && statement != StatementId::UNNAMED {
+                self.inner.stream.write_msg(Close::Statement(statement))?;
+            }
+
             // finally, [Sync] asks postgres to process the messages that we sent and respond with
             // a [ReadyForQuery] message when it's completely done. Theoretically, we could send
             // dozens of queries before a [Sync] and postgres can handle that. Execution on the server
@@ -319,13 +344,30 @@ impl PgConnection {
             QueryLogger::new_under_span(query, self.inner.log_settings.clone(), parent_span)
                 .with_db_system_name("postgresql");
         let span = logger.span();
-        let sql = logger.sql().as_str();
+        // When the `sqlcommenter` feature is enabled and an OTel trace context is
+        // active, appends `/*traceparent=...*/` to the SQL on the wire so server-side
+        // observability tools can correlate. With no context (or feature off), the
+        // returned Cow is Borrowed and this is a zero-cost no-op.
+        let sql_cow = sqlx_core::sqlcommenter::maybe_append_comment(logger.sql().as_str(), &span);
+        let sql = sql_cow.as_ref();
+        // When a comment was appended, each call has a unique trace id baked
+        // into the SQL, so caching the prepared statement would (a) miss every
+        // time anyway and (b) silently fill the LRU with one-shot statements.
+        // Skip the cache in that case — but still use a *named* server-side
+        // statement, not the unnamed one: type-resolution side trips between
+        // Parse and Bind (`resolve_statement_metadata`, `apply_patches`) can
+        // issue simple Query messages, which destroy the unnamed statement.
+        // The named statement is `Close::Statement`d after Execute so
+        // Postgres doesn't hold it.
+        let comment_appended = matches!(sql_cow, std::borrow::Cow::Owned(_));
+        let cache = persistent && !comment_appended;
+        let named = persistent || comment_appended;
 
         // before we continue, wait until we are "ready" to accept more queries
         self.wait_until_ready().await?;
 
         let (mut format, mut metadata) = self
-            .try_get_or_prepare(sql, arguments.as_mut(), persistent, metadata_opt.clone())
+            .try_get_or_prepare(sql, arguments.as_mut(), named, cache, metadata_opt.clone())
             .await?;
 
         let mut message = match self.inner.stream.recv().await {
@@ -350,7 +392,8 @@ impl PgConnection {
                             sql,
                             // It should be safe to retry `patch` on the same arguments
                             arguments.as_mut(),
-                            persistent,
+                            named,
+                            cache,
                             metadata_opt.clone(),
                         )
                         .await?;
@@ -525,7 +568,7 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
             self.wait_until_ready().await?;
 
             let (_, metadata) = self
-                .get_or_prepare(sql.as_str(), parameters, true, None, true)
+                .get_or_prepare(sql.as_str(), parameters, true, true, None, true)
                 .await?;
 
             Ok(PgStatement { sql, metadata })
@@ -544,7 +587,7 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
             self.wait_until_ready().await?;
 
             let (stmt_id, metadata) = self
-                .get_or_prepare(sql.as_str(), &[], true, None, true)
+                .get_or_prepare(sql.as_str(), &[], true, true, None, true)
                 .await?;
 
             let nullable = self.get_nullable_for_columns(stmt_id, &metadata).await?;

@@ -112,13 +112,25 @@ impl MySqlConnection {
         let mut logger =
             QueryLogger::new_under_span(sql, self.inner.log_settings.clone(), parent_span)
                 .with_db_system_name("mysql");
+        // The generator needs its own clone of the span because the outer
+        // `InstrumentedStream::new(..., span)` below also consumes one. Cloning
+        // a `tracing::Span` is Arc-backed and cheap.
         let span = logger.span();
+        let span_for_stream = span.clone();
 
         self.inner.stream.wait_until_ready().await?;
         self.inner.stream.waiting.push_back(Waiting::Result);
 
         let stream = try_stream! {
-        let sql = logger.sql().as_str();
+        // Same sqlcommenter handling as the postgres path. Computed inside the
+        // generator so the `Cow::Borrowed` case can live alongside `logger`
+        // (which is captured by move) without a self-referential closure.
+        let sql_cow = sqlx_core::sqlcommenter::maybe_append_comment(logger.sql().as_str(), &span_for_stream);
+        let sql = sql_cow.as_ref();
+        // When a comment was actually appended, route through the non-cached prepare
+        // path so we don't fill the statement cache with one-shot entries whose
+        // trace id won't match future calls. Same wire round-trips.
+        let persistent = persistent && matches!(sql_cow, std::borrow::Cow::Borrowed(_));
 
             // make a slot for the shared column data
             // as long as a reference to a row is not held past one iteration, this enables us
