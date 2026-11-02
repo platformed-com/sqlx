@@ -43,6 +43,7 @@ pub(crate) struct MySqlConnectionInner {
 
     // transaction status
     pub(crate) transaction_depth: usize,
+    pub(crate) transaction_span: Option<(tracing::Span, Option<tracing::Id>)>,
     status_flags: Status,
 
     // cache by query string to the statement id and metadata

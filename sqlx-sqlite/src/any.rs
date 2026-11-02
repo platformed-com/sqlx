@@ -88,9 +88,17 @@ impl AnyConnectionBackend for SqliteConnection {
         let persistent = persistent && arguments.is_some();
         let args = arguments.map(map_arguments);
 
+        let parent_span = SqliteTransactionManager::query_parent_span(self);
         Box::pin(
             self.worker
-                .execute(query, args, self.row_channel_size, persistent, None)
+                .execute(
+                    query,
+                    args,
+                    self.row_channel_size,
+                    persistent,
+                    None,
+                    parent_span,
+                )
                 .map_ok(flume::Receiver::into_stream)
                 .try_flatten_stream()
                 .map(
@@ -111,10 +119,18 @@ impl AnyConnectionBackend for SqliteConnection {
         let persistent = persistent && arguments.is_some();
         let args = arguments.map(map_arguments);
 
+        let parent_span = SqliteTransactionManager::query_parent_span(self);
         Box::pin(async move {
             let mut stream = pin!(
                 self.worker
-                    .execute(query, args, self.row_channel_size, persistent, Some(1))
+                    .execute(
+                        query,
+                        args,
+                        self.row_channel_size,
+                        persistent,
+                        Some(1),
+                        parent_span,
+                    )
                     .map_ok(flume::Receiver::into_stream)
                     .await?
             );

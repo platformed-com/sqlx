@@ -74,6 +74,7 @@ pub struct PgConnectionInner {
     // current transaction status
     transaction_status: TransactionStatus,
     pub(crate) transaction_depth: usize,
+    pub(crate) transaction_span: Option<(tracing::Span, Option<tracing::Id>)>,
 
     log_settings: LogSettings,
 }

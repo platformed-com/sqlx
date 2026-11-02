@@ -77,6 +77,17 @@ pub struct QueryLogger {
 
 impl QueryLogger {
     pub fn new(sql: SqlStr, settings: LogSettings) -> Self {
+        Self::new_under_span(sql, settings, None)
+    }
+
+    /// Like [`new`](Self::new) but creates the query span as a child of
+    /// `parent_span` instead of [`tracing::Span::current`].
+    ///
+    /// Backends use this to attribute queries running inside a transaction to that
+    /// transaction's span — the parent comes from a per-connection tx span stack
+    /// maintained by [`TransactionManager`](crate::transaction::TransactionManager).
+    /// Passing `None` falls back to the contextual current span, matching `new`.
+    pub fn new_under_span(sql: SqlStr, settings: LogSettings, parent_span: Option<Span>) -> Self {
         // Hardcoded INFO level per maintainer review of #3313: libraries should pick a
         // level and let consumers filter via `EnvFilter`. Field names follow the OTel
         // database span semantic conventions
@@ -85,6 +96,7 @@ impl QueryLogger {
         // to set the exported `SpanKind`. `db.system.name` is declared empty here and
         // filled in by drivers via `with_db_system_name`, so adding the field doesn't
         // force a signature break on `QueryLogger::new`.
+        let parent = parent_span.unwrap_or_else(Span::current);
         let summary = parse_query_summary(sql.as_str());
         let operation = summary
             .split_whitespace()
@@ -93,6 +105,7 @@ impl QueryLogger {
             .unwrap_or_default();
         let span = tracing::info_span!(
             target: "sqlx::query",
+            parent: &parent,
             "db.query",
             "db.system.name" = tracing::field::Empty,
             "db.operation.name" = operation,
